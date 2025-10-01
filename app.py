@@ -1,326 +1,142 @@
-# -*- coding: utf-8 -*-
-"""
-App Streamlit: Inspeção de Transformadores (Google Drive)
---------------------------------------------------------
-- Tira fotos pelo celular (câmera) ou envia da galeria
-- Vincula ao Nº de Série
-- Gera ZIP (fotos + registro.csv)
-- Envia automaticamente para o Google Drive, em subpastas por Nº de Série
-
-Requisitos (requirements.txt):
-    streamlit
-    pillow
-    pandas
-    google-api-python-client
-    google-auth
-    google-auth-httplib2
-    httplib2
-    pillow-heif  # para fotos HEIC do iPhone
-    httplib2
-
-Secrets (.streamlit/secrets.toml) — exemplo:
-    [google]
-    type = "service_account"
-    project_id = "SEU_PROJETO"
-    private_key_id = "..."
-    private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-    client_email = "sua-conta@seu-projeto.iam.gserviceaccount.com"
-    client_id = "..."
-    token_uri = "https://oauth2.googleapis.com/token"
-    drive_folder_id = "ID_DA_PASTA_RAIZ_NO_DRIVE"
-
-Uso local:
-    streamlit run inspecao-transformadores-drive.py
-
-Publicação (Streamlit Community Cloud):
-    Configure os Secrets do Google, suba este arquivo e o requirements.txt e publique.
-"""
-
-from __future__ import annotations
 import io
-from datetime import datetime
-from pathlib import Path
-from typing import List, Optional, Tuple
-
-import pandas as pd
-from PIL import Image
-
-# Suporte a HEIC/HEIF (iPhone)
-try:
-    import pillow_heif
-    pillow_heif.register_heif_opener()
-except Exception:
-    pillow_heif = None  # segue sem HEIC, mas avisaremos no UI
+import os
+import zipfile
+import requests
 import streamlit as st
+from datetime import datetime
 
-# Google Drive API
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+# --------------------
+# Configuração / Segredos
+# --------------------
+# Defina em .streamlit/secrets.toml:
+# [telegram]
+# BOT_TOKEN = "123456:ABC..."
+# CHAT_ID = "-1001234567890"  # seu chat privado ou grupo/canal
 
-# -----------------------------
-# Config da página
-# -----------------------------
-st.set_page_config(page_title="Inspeção • Google Drive", page_icon="📁", layout="centered")
+BOT_TOKEN = st.secrets.get("telegram", {}).get("BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))
+CHAT_ID = st.secrets.get("telegram", {}).get("CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))
 
-# -----------------------------
-# Constantes e utilidades
-# -----------------------------
-BASE_DIR = Path('.')
-DATA_DIR = BASE_DIR / 'data'
-DATA_DIR.mkdir(exist_ok=True)
-DATE_FMT = "%Y-%m-%d_%H-%M-%S"
+st.set_page_config(page_title="Zip & Envia para Telegram", page_icon="📦", layout="centered")
 
+st.title("📦 Zip & Envie Fotos para o Telegram")
+st.write("Selecione várias fotos, gere um .zip e envie para o seu bot no Telegram.")
 
-def ensure_serial_dir(serial: str) -> Path:
-    safe = serial.strip().replace('/', '-').replace('\\', '-').replace('..', '-')
-    d = DATA_DIR / safe
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def pil_from_uploaded(file) -> Image.Image:
-    """Abre imagem de UploadedFile em RGB, com suporte opcional a HEIC se pillow-heif estiver instalado."""
-    try:
-        return Image.open(file).convert('RGB')
-    except Exception as e:
-        # Tentativa extra: algumas libs exigem bytes para HEIC
-        try:
-            data = file.read()
-            file.seek(0)
-            return Image.open(io.BytesIO(data)).convert('RGB')
-        except Exception as e2:
-            raise e2
-
-
-def drive_service_from_secrets():
-    if 'google' not in st.secrets:
-        st.stop()
-    scopes = ['https://www.googleapis.com/auth/drive']
-    info = dict(st.secrets['google'])
-    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    return build('drive', 'v3', credentials=creds)
-
-
-def drive_ensure_subfolder(service, parent_id: str, name: str) -> Optional[str]:
-    """Garante subpasta <name> dentro de parent_id. Compatível com Meu Drive e Drives Compartilhados."""
-    q = (
-        f"name='{name}' and mimeType='application/vnd.google-apps.folder' "
-        f"and '{parent_id}' in parents and trashed=false"
-    )
-    res = service.files().list(
-        q=q,
-        spaces='drive',
-        fields='files(id, name)',
-        pageSize=1,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute()
-    files = res.get('files', [])
-    if files:
-        return files[0]['id']
-    file_metadata = {
-        'name': name,
-        'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [parent_id],
-    }
-    folder = service.files().create(
-        body=file_metadata,
-        fields='id',
-        supportsAllDrives=True,
-    ).execute()
-    return folder.get('id')
-
-
-def drive_upload_bytes(service, parent_id: str, filename: str, data: bytes, mime: str):
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
-    meta = {'name': filename, 'parents': [parent_id]}
-    return service.files().create(
-        body=meta,
-        media_body=media,
-        fields='id,webViewLink',
-        supportsAllDrives=True,
-    ).execute()
-
-
-def save_and_upload(serial: str, images: List[Image.Image]) -> Path:
-    """Salva local (ZIP + CSV) e sobe CSV + JPGs ao Drive na subpasta do serial."""
-    serial_dir = ensure_serial_dir(serial)
-    log_csv = serial_dir / 'registro.csv'
-
-    # Salva local e prepara bytes para upload
-    raw_pairs: List[Tuple[str, bytes]] = []
-    for i, img in enumerate(images, start=1):
-        ts = datetime.now().strftime(DATE_FMT)
-        fname = f"{serial}_{ts}_{i:03d}.jpg"
-        fpath = serial_dir / fname
-        img.save(fpath, format='JPEG', quality=90)
-        buf = io.BytesIO()
-        img.save(buf, format='JPEG', quality=90)
-        raw_pairs.append((fname, buf.getvalue()))
-
-        # Atualiza CSV
-        row = {
-            'timestamp': datetime.now().isoformat(timespec='seconds'),
-            'serial': serial,
-            'arquivo': fname,
-        }
-        if log_csv.exists():
-            df = pd.read_csv(log_csv)
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        else:
-            df = pd.DataFrame([row])
-        df.to_csv(log_csv, index=False)
-
-    # ZIP local do serial
-    import shutil
-    zip_base = DATA_DIR / f"{serial}_inspecao"
-    for ext in ('.zip',):
-        zc = DATA_DIR / f"{serial}_inspecao{ext}"
-        if zc.exists():
-            zc.unlink()
-    zip_path = Path(shutil.make_archive(str(zip_base), 'zip', root_dir=serial_dir))
-
-    # Upload ao Drive
-    service = drive_service_from_secrets()
-    parent = st.secrets['google'].get('drive_folder_id')
-    if not parent:
-        st.error("'drive_folder_id' não definido em [google] nos Secrets.")
-        return zip_path
-
-    # Valida acesso ao parent (Meu Drive ou Drive Compartilhado)
-    try:
-        _ = service.files().get(fileId=parent, fields='id, name, mimeType', supportsAllDrives=True).execute()
-    except Exception as e:
-        st.error("Não consegui acessar a pasta raiz no Drive. Verifique se o ID está correto e se a pasta foi compartilhada com a conta de serviço como Editor.")
-        st.info("Dicas: 1) Abra a pasta no Drive e copie o trecho após /folders/; 2) Se for 'Drive compartilhado', garanta que a conta de serviço é Membro do drive; 3) Evite usar atalho (shortcut).")
-        return zip_path
-
-    sub_id = drive_ensure_subfolder(service, parent, serial)
-
-    # Envia CSV
-    with open(log_csv, 'rb') as f:
-        _ = drive_upload_bytes(service, sub_id, 'registro.csv', f.read(), 'text/csv')
-    st.success("CSV enviado ao Drive.")
-
-    # Envia fotos
-    for name, data in raw_pairs:
-        try:
-            _ = drive_upload_bytes(service, sub_id, name, data, 'image/jpeg')
-            st.toast(f"Imagem enviada: {name}")
-        except Exception as e:
-            st.error(f"Falha ao enviar {name} ao Drive: {e}")
-
-    return zip_path
-
-# -----------------------------
-# Estado da sessão
-# -----------------------------
-if 'photos' not in st.session_state:
-    st.session_state.photos: List[Image.Image] = []
-
-# -----------------------------
-# UI
-# -----------------------------
-st.title("📸 Inspeção • Google Drive")
-st.caption("Nº de série → Fotos → ZIP + Upload automático para o Drive")
-
-with st.form("frm", clear_on_submit=False):
-    if pillow_heif is None:
-        st.info("Se você usar fotos HEIC (iPhone), instale 'pillow-heif' no requirements para converter automaticamente para JPG.")
-    serial = st.text_input("Número de série", placeholder="Ex.: TRF-2025-001", max_chars=100)
-
-    st.markdown("**Câmera do celular**")
-    cam = st.camera_input("Toque para tirar a foto (repita quantas quiser)")
-
-    st.markdown("**Galeria (opcional)**")
-    uploads = st.file_uploader(
-        "Selecione imagens da galeria (pode várias)",
-        type=["png", "jpg", "jpeg", "webp", "heic"],
-        accept_multiple_files=True,
-    )
-
-    c1, c2, c3 = st.columns(3)
-    add_cam = c1.form_submit_button("➕ Add foto da câmera")
-    add_up = c2.form_submit_button("➕ Add da galeria")
-    clear_ = c3.form_submit_button("🗑️ Limpar lista")
-
-    if add_cam:
-        if not serial.strip():
-            st.warning("Informe o número de série antes de adicionar fotos.")
-        elif cam is None:
-            st.warning("Tire uma foto para adicionar.")
-        else:
-            try:
-                img = pil_from_uploaded(cam)
-                st.session_state.photos.append(img)
-                st.success("Foto adicionada.")
-            except Exception as e:
-                st.error(f"Erro ao processar a foto: {e}")
-
-    if add_up:
-        if not serial.strip():
-            st.warning("Informe o número de série antes de adicionar fotos.")
-        elif not uploads:
-            st.warning("Selecione uma ou mais imagens.")
-        else:
-            ok = 0
-            for uf in uploads:
-                try:
-                    img = pil_from_uploaded(uf)
-                    st.session_state.photos.append(img)
-                    ok += 1
-                except Exception as e:
-                    st.error(f"Erro com {getattr(uf, 'name', 'arquivo')}: {e}")
-            if ok:
-                st.success(f"{ok} imagem(ns) adicionada(s).")
-
-    if clear_:
-        st.session_state.photos = []
-        st.info("Lista de fotos esvaziada.")
-
-# Lista de miniaturas
-if st.session_state.photos:
-    st.subheader("Fotos na fila")
-    for i, img in enumerate(st.session_state.photos, start=1):
-        st.image(img, caption=f"Foto #{i}", use_container_width=True)
-else:
-    st.info("Nenhuma foto adicionada ainda.")
-
-st.divider()
-
-colA, colB = st.columns(2)
-with colA:
-    if st.button("💾 Salvar & Enviar ao Drive", type="primary", use_container_width=True):
-        if not serial.strip():
-            st.error("Informe o número de série no formulário.")
-        elif not st.session_state.photos:
-            st.warning("Adicione pelo menos uma foto.")
-        else:
-            try:
-                zip_path = save_and_upload(serial.strip(), st.session_state.photos)
-                st.success("Concluído! Baixe o ZIP abaixo e confira no Drive.")
-                with open(zip_path, 'rb') as f:
-                    st.download_button(
-                        "⬇️ Baixar pacote ZIP",
-                        f,
-                        file_name=zip_path.name,
-                        mime="application/zip",
-                        use_container_width=True,
-                    )
-            except Exception as e:
-                st.error(f"Falha: {e}")
-
-with colB:
-    if st.button("🔄 Reiniciar sessão", use_container_width=True):
-        st.session_state.photos = []
-        st.rerun()
-
-st.markdown(
-    """
----
-**Dicas**
-- Compartilhe sua pasta raiz do Drive (ID em `drive_folder_id`) com o e-mail da conta de serviço, como **Editor**.
-- Para 18 trafos: gere e envie um pacote por série, depois avance para o próximo.
-    """
+# --------------------
+# Upload de arquivos
+# --------------------
+files = st.file_uploader(
+    "Envie suas imagens (png, jpg, jpeg, webp)",
+    type=["png", "jpg", "jpeg", "webp", "heic", "heif"],
+    accept_multiple_files=True,
 )
+
+zip_name_default = f"fotos_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+zip_name = st.text_input("Nome do arquivo ZIP", value=zip_name_default)
+
+col1, col2 = st.columns(2)
+with col1:
+    gerar = st.button("Gerar ZIP")
+with col2:
+    enviar = st.button("Gerar e Enviar para Telegram")
+
+@st.cache_data(show_spinner=False)
+def make_zip_in_memory(file_objs, zip_filename: str) -> bytes:
+    """Compacta uma lista de arquivos enviados (UploadedFile) em um ZIP em memória."""
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in file_objs:
+            # Normaliza nome
+            fname = os.path.basename(f.name)
+            # Algumas câmeras criam nomes com espaços/caracteres especiais
+            fname = fname.replace(" ", "_")
+            # Lê bytes do arquivo
+            data = f.read()
+            # Retorna o cursor do arquivo para início (caso seja reutilizado)
+            f.seek(0)
+            zf.writestr(fname, data)
+    # Retorna bytes do zip
+    mem_zip.seek(0)
+    return mem_zip.getvalue()
+
+
+def send_zip_to_telegram(zip_bytes: bytes, filename: str, bot_token: str, chat_id: str, caption: str = ""):
+    """Envia um ZIP como documento para o Telegram usando a Bot API."""
+    if not bot_token or not chat_id:
+        raise ValueError("BOT_TOKEN ou CHAT_ID ausentes. Configure em st.secrets ou variáveis de ambiente.")
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    files = {"document": (filename, io.BytesIO(zip_bytes), "application/zip")}
+    data = {"chat_id": chat_id, "caption": caption}
+    resp = requests.post(url, data=data, files=files, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Falha no envio: {resp.status_code} - {resp.text}")
+    return resp.json()
+
+
+if files and (gerar or enviar):
+    with st.spinner("Gerando ZIP..."):
+        try:
+            zip_bytes = make_zip_in_memory(files, zip_name)
+        except Exception as e:
+            st.error(f"Erro ao gerar ZIP: {e}")
+            st.stop()
+
+    st.success("ZIP gerado com sucesso!")
+    st.download_button("⬇️ Baixar ZIP", data=zip_bytes, file_name=zip_name, mime="application/zip")
+
+    if enviar:
+        caption = st.text_input("Legenda (opcional)", value=f"Enviado via Streamlit em {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        go = st.button("Confirmar envio")
+        if go:
+            with st.spinner("Enviando para o Telegram..."):
+                try:
+                    result = send_zip_to_telegram(zip_bytes, zip_name, BOT_TOKEN, CHAT_ID, caption)
+                except Exception as e:
+                    st.error(f"Erro no envio: {e}")
+                else:
+                    st.success("Enviado com sucesso para o Telegram!")
+                    st.json(result)
+
+# --------------------
+# Ajuda / Diagnóstico
+# --------------------
+with st.expander("⚙️ Diagnóstico / Como configurar"):
+    st.markdown(
+        """
+        **1) Criar o bot e pegar o token**
+        - No Telegram, fale com **@BotFather**
+        - Comando `/newbot` → siga as instruções e copie o **BOT TOKEN**
+
+        **2) Descobrir seu `chat_id`** (onde o ZIP será entregue)
+        - Opção simples: adicione o bot a um **grupo**, envie uma mensagem qualquer no grupo e depois acesse:
+          `https://api.telegram.org/botSEU_TOKEN/getUpdates` e procure por `chat":{"id": ...}
+        - Para chat privado, inicie conversa com o bot e repita o `getUpdates`.
+
+        **3) Colocar credenciais no Streamlit Cloud**
+        - Vá em *Settings → Secrets* e cole:
+
+          ```toml
+          [telegram]
+          BOT_TOKEN = "123456:ABC-DEF..."
+          CHAT_ID = "-1001234567890"
+          ```
+
+        **4) Rodar localmente**
+        ```bash
+        pip install -r requirements.txt
+        streamlit run app.py
+        ```
+
+        **Requisitos (requirements.txt)**
+        ```
+        streamlit>=1.37
+        requests>=2.31
+        ```
+
+        **Notas**
+        - Limite do Telegram: documentos até **50 MB** (em alguns clientes 2000 MB), mas via Bot API normalmente **50 MB** por arquivo; se seu ZIP for maior, divida-o.
+        - Para fotos .heic/.heif, o app envia como estão. Se precisar converter para .jpg, faça a conversão antes do upload.
+        - Segurança: nunca exponha o token do bot no código público; use `st.secrets`.
+        - Se quiser enviar também como álbum de fotos (sem zip), use `sendMediaGroup` da Bot API.
+        """
+    )
