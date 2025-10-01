@@ -15,6 +15,8 @@ Requisitos (requirements.txt):
     google-auth
     google-auth-httplib2
     httplib2
+    pillow-heif  # para fotos HEIC do iPhone
+    httplib2
 
 Secrets (.streamlit/secrets.toml) — exemplo:
     [google]
@@ -42,6 +44,13 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 from PIL import Image
+
+# Suporte a HEIC/HEIF (iPhone)
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except Exception:
+    pillow_heif = None  # segue sem HEIC, mas avisaremos no UI
 import streamlit as st
 
 # Google Drive API
@@ -71,7 +80,17 @@ def ensure_serial_dir(serial: str) -> Path:
 
 
 def pil_from_uploaded(file) -> Image.Image:
-    return Image.open(file).convert('RGB')
+    """Abre imagem de UploadedFile em RGB, com suporte opcional a HEIC se pillow-heif estiver instalado."""
+    try:
+        return Image.open(file).convert('RGB')
+    except Exception as e:
+        # Tentativa extra: algumas libs exigem bytes para HEIC
+        try:
+            data = file.read()
+            file.seek(0)
+            return Image.open(io.BytesIO(data)).convert('RGB')
+        except Exception as e2:
+            raise e2
 
 
 def drive_service_from_secrets():
@@ -84,27 +103,44 @@ def drive_service_from_secrets():
 
 
 def drive_ensure_subfolder(service, parent_id: str, name: str) -> Optional[str]:
+    """Garante subpasta <name> dentro de parent_id. Compatível com Meu Drive e Drives Compartilhados."""
     q = (
         f"name='{name}' and mimeType='application/vnd.google-apps.folder' "
         f"and '{parent_id}' in parents and trashed=false"
     )
-    res = service.files().list(q=q, spaces='drive', fields='files(id,name)', pageSize=1).execute()
+    res = service.files().list(
+        q=q,
+        spaces='drive',
+        fields='files(id, name)',
+        pageSize=1,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
     files = res.get('files', [])
     if files:
         return files[0]['id']
-    meta = {
+    file_metadata = {
         'name': name,
         'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [parent_id]
+        'parents': [parent_id],
     }
-    folder = service.files().create(body=meta, fields='id').execute()
+    folder = service.files().create(
+        body=file_metadata,
+        fields='id',
+        supportsAllDrives=True,
+    ).execute()
     return folder.get('id')
 
 
 def drive_upload_bytes(service, parent_id: str, filename: str, data: bytes, mime: str):
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
     meta = {'name': filename, 'parents': [parent_id]}
-    return service.files().create(body=meta, media_body=media, fields='id,webViewLink').execute()
+    return service.files().create(
+        body=meta,
+        media_body=media,
+        fields='id,webViewLink',
+        supportsAllDrives=True,
+    ).execute()
 
 
 def save_and_upload(serial: str, images: List[Image.Image]) -> Path:
@@ -152,6 +188,14 @@ def save_and_upload(serial: str, images: List[Image.Image]) -> Path:
         st.error("'drive_folder_id' não definido em [google] nos Secrets.")
         return zip_path
 
+    # Valida acesso ao parent (Meu Drive ou Drive Compartilhado)
+    try:
+        _ = service.files().get(fileId=parent, fields='id, name, mimeType', supportsAllDrives=True).execute()
+    except Exception as e:
+        st.error("Não consegui acessar a pasta raiz no Drive. Verifique se o ID está correto e se a pasta foi compartilhada com a conta de serviço como Editor.")
+        st.info("Dicas: 1) Abra a pasta no Drive e copie o trecho após /folders/; 2) Se for 'Drive compartilhado', garanta que a conta de serviço é Membro do drive; 3) Evite usar atalho (shortcut).")
+        return zip_path
+
     sub_id = drive_ensure_subfolder(service, parent, serial)
 
     # Envia CSV
@@ -161,8 +205,11 @@ def save_and_upload(serial: str, images: List[Image.Image]) -> Path:
 
     # Envia fotos
     for name, data in raw_pairs:
-        _ = drive_upload_bytes(service, sub_id, name, data, 'image/jpeg')
-        st.toast(f"Imagem enviada: {name}")
+        try:
+            _ = drive_upload_bytes(service, sub_id, name, data, 'image/jpeg')
+            st.toast(f"Imagem enviada: {name}")
+        except Exception as e:
+            st.error(f"Falha ao enviar {name} ao Drive: {e}")
 
     return zip_path
 
@@ -179,6 +226,8 @@ st.title("📸 Inspeção • Google Drive")
 st.caption("Nº de série → Fotos → ZIP + Upload automático para o Drive")
 
 with st.form("frm", clear_on_submit=False):
+    if pillow_heif is None:
+        st.info("Se você usar fotos HEIC (iPhone), instale 'pillow-heif' no requirements para converter automaticamente para JPG.")
     serial = st.text_input("Número de série", placeholder="Ex.: TRF-2025-001", max_chars=100)
 
     st.markdown("**Câmera do celular**")
