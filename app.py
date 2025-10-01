@@ -1,7 +1,7 @@
 import io
 import os
 import zipfile
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Set
 import requests
 import streamlit as st
 from PIL import Image
@@ -66,7 +66,7 @@ else:
 # =====================================
 # Utilidades
 # =====================================
-def sizeof_fmt(num: int | None) -> str:
+def sizeof_fmt(num: Optional[int]) -> str:
     if not num:
         return "0 B"
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -92,7 +92,7 @@ def unique_photo_name(original_name: str, serial: str, counter: int) -> str:
     serial_tag = f"NS-{slugify(serial)}_" if serial else ""
     return f"{serial_tag}{root}_{counter:03d}{ext}"
 
-def ensure_unique(name: str, used: set) -> str:
+def ensure_unique(name: str, used: Set[str]) -> str:
     """Evita colisão dentro do ZIP."""
     if name not in used:
         used.add(name)
@@ -106,7 +106,7 @@ def ensure_unique(name: str, used: set) -> str:
     used.add(new_name)
     return new_name
 
-def apply_serial_to_zipname(base_zip: str, serial: str, part: int | None = None) -> str:
+def apply_serial_to_zipname(base_zip: str, serial: str, part: Optional[int] = None) -> str:
     root, ext = split_name_ext(base_zip if base_zip else "fotos.zip")
     if ext != ".zip":
         ext = ".zip"
@@ -128,12 +128,17 @@ def try_convert_heic_to_jpg(buffer: bytes) -> bytes:
     except Exception:
         return buffer  # sem conversão se falhar
 
-def make_zip_in_memory(file_objs, filename: str, serial: str = "", convert_heic: bool = False,
-                       compresslevel: int = 9) -> bytes:
+def make_zip_in_memory(
+    file_objs,
+    filename: str,
+    serial: str = "",
+    convert_heic: bool = False,
+    compresslevel: int = 9
+) -> bytes:
     """Gera um ZIP em memória. Prefixa cada foto com NS e adiciona MANIFESTO.txt."""
     mem = io.BytesIO()
-    used_names = set()
-    listed_names = []
+    used_names: Set[str] = set()
+    listed_names: List[str] = []
 
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=compresslevel) as zf:
         for idx, f in enumerate(file_objs, start=1):
@@ -188,7 +193,9 @@ def send_zip_to_telegram(zip_bytes: bytes, filename: str, bot_token: str, chat_i
 
 def chunk_files_by_size(files, max_bytes=45 * 1024 * 1024):
     """Divide arquivos em lotes cuja soma não exceda max_bytes (para contornar limite da Bot API)."""
-    batches, current, total = [], [], 0
+    batches: List[List] = []
+    current: List = []
+    total = 0
     for f in files:
         f.seek(0, os.SEEK_END)
         size = f.tell()
@@ -258,8 +265,8 @@ with tabs[2]:
     st.caption(f"Exemplo de nome final: **{apply_serial_to_zipname(base_zip_name, serial)}**")
 
 with tabs[3]:
-    st.markdown("""
-**Configuração local:**
+    st.markdown('''
+**Configuração local (.streamlit/secrets.toml):**
 ```toml
 [telegram]
 BOT_TOKEN = "123456:ABC..."
