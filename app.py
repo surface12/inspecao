@@ -265,7 +265,7 @@ with tabs[2]:
     st.caption(f"Exemplo de nome final: **{apply_serial_to_zipname(base_zip_name, serial)}**")
 
 with tabs[3]:
-    st.markdown('''
+    st.markdown("""
 **Configuração local (.streamlit/secrets.toml):**
 ```toml
 [telegram]
