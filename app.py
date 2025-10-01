@@ -18,10 +18,7 @@ Como executar localmente:
   4) No celular na mesma rede, abra o IP da máquina + porta mostrada pelo Streamlit
 
 Como publicar no Streamlit Community Cloud (grátis):
-  1) Suba este arquivo e um requirements.txt com:  streamlit
-pillow
-pandas
-requests
+  1) Suba este arquivo e um requirements.txt com:  streamlit\npillow\npandas\nrequests
   2) Vá em https://share.streamlit.io , conecte seu GitHub, selecione o repositório e este arquivo como entrypoint
   3) O serviço gera um link público que você pode abrir no celular
 
@@ -29,12 +26,7 @@ Configurar upload para GitHub (opcional, recomendado para persistência):
   • Crie um **Personal Access Token (classic)** com escopo `repo` (para repositórios privados ou públicos)
   • No Streamlit Cloud, adicione em **Secrets** (ou localmente no arquivo `.streamlit/secrets.toml`):
 
-    [github]
-    token = "ghp_xxx_somente_exemplo"
-    owner = "seu-usuario-ou-org"
-    repo = "nome-do-repositorio"
-    branch = "main"
-    base_path = "inspecoes"  # pasta destino dentro do repo
+    [github]\n    token = "ghp_xxx_somente_exemplo"\n    owner = "seu-usuario-ou-org"\n    repo = "nome-do-repositorio"\n    branch = "main"\n    base_path = "inspecoes"  # pasta destino dentro do repo
 
   • Durante o uso, marque a opção **“Enviar para GitHub”** antes de salvar.
 
@@ -75,7 +67,7 @@ DATE_FMT = "%Y-%m-%d_%H-%M-%S"
 
 
 def ensure_serial_dir(serial: str) -> Path:
-    safe = serial.strip().replace('/', '-').replace('\', '-').replace('..', '-')
+    safe = serial.strip().replace('/', '-').replace('\\', '-').replace('..', '-')
     d = DATA_DIR / safe
     d.mkdir(parents=True, exist_ok=True)
     return d
